@@ -51,6 +51,7 @@ int ObAiServiceProxy::insert_ai_endpoint(ObMySQLTransaction &trans, const int64_
   } else if (OB_FAIL(sql.add_column("parameters", ObHexEscapeSqlStr(endpoint.parameters_)))) {
   } else if (OB_FAIL(sql.add_column("request_transform_fn", ObHexEscapeSqlStr(endpoint.request_transform_fn_)))) {
   } else if (OB_FAIL(sql.add_column("response_transform_fn", ObHexEscapeSqlStr(endpoint.response_transform_fn_)))) {
+  } else if (OB_FAIL(sql.add_column("max_concurrency", endpoint.max_concurrency_ > 0 ? endpoint.max_concurrency_ : 1))) {
   } else if (OB_FAIL(sql.splice_insert_sql(OB_ALL_AI_MODEL_ENDPOINT_TNAME, buffer))) {
   } else if (OB_FAIL(trans.write(buffer.ptr(), affected_rows))) {
   } else if (1 != affected_rows) {
@@ -83,6 +84,7 @@ int ObAiServiceProxy::update_ai_endpoint(ObMySQLTransaction &trans, const int64_
   } else if (OB_FAIL(sql.add_column("parameters", ObHexEscapeSqlStr(endpoint.parameters_)))) {
   } else if (OB_FAIL(sql.add_column("request_transform_fn", ObHexEscapeSqlStr(endpoint.request_transform_fn_)))) {
   } else if (OB_FAIL(sql.add_column("response_transform_fn", ObHexEscapeSqlStr(endpoint.response_transform_fn_)))) {
+  } else if (OB_FAIL(sql.add_column("max_concurrency", endpoint.max_concurrency_ > 0 ? endpoint.max_concurrency_ : 1))) {
   } else if (OB_FAIL(sql.splice_update_sql(OB_ALL_AI_MODEL_ENDPOINT_TNAME, buffer))) {
   } else if (OB_FAIL(trans.write(buffer.ptr(), affected_rows))) {
   } else if (1 != affected_rows) {
@@ -195,17 +197,45 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   ObString request_transform_fn;
   ObString response_transform_fn;
   int64_t type = 0;
+  // [ai-enhance] track which nullable columns are SQL NULL, so that a later
+  // UPDATE (ALTER) writes NULL back for them instead of empty string.
+  bool provider_is_null = false;
+  bool request_model_name_is_null = false;
+  bool arguments_is_null = false;
+  bool request_transform_fn_is_null = false;
+  bool response_transform_fn_is_null = false;
+  bool opt_not_exist = false;
   EXTRACT_INT_FIELD_MYSQL(result, "endpoint_id", endpoint.endpoint_id_, uint64_t);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "scope", scope);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "endpoint_name", name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "ai_model_name", ai_model_name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "url", url);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "access_key", access_key);
-  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "provider", provider, true, false, ""/*wont be used*/);
-  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "request_model_name", request_model_name, true, false, ""/*wont be used*/);
-  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "parameters", arguments, true, false, ""/*wont be used*/);
-  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "request_transform_fn", request_transform_fn, true, false, ""/*wont be used*/);
-  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "response_transform_fn", response_transform_fn, true, false, ""/*wont be used*/);
+  EXTRACT_VARCHAR_FIELD_MYSQL_SKIP_RET_WITH_COLUMN_INFO(result, "provider", provider, provider_is_null, opt_not_exist);
+  EXTRACT_VARCHAR_FIELD_MYSQL_SKIP_RET_WITH_COLUMN_INFO(result, "request_model_name", request_model_name, request_model_name_is_null, opt_not_exist);
+  EXTRACT_VARCHAR_FIELD_MYSQL_SKIP_RET_WITH_COLUMN_INFO(result, "parameters", arguments, arguments_is_null, opt_not_exist);
+  EXTRACT_VARCHAR_FIELD_MYSQL_SKIP_RET_WITH_COLUMN_INFO(result, "request_transform_fn", request_transform_fn, request_transform_fn_is_null, opt_not_exist);
+  EXTRACT_VARCHAR_FIELD_MYSQL_SKIP_RET_WITH_COLUMN_INFO(result, "response_transform_fn", response_transform_fn, response_transform_fn_is_null, opt_not_exist);
+  EXTRACT_INT_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "max_concurrency", endpoint.max_concurrency_, int64_t, true, false, 1);
+  if (OB_SUCC(ret) && opt_not_exist) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("optional column not found in ai model endpoint table", K(ret), K(opt_not_exist));
+  }
+  if (OB_SUCC(ret) && provider_is_null) {
+    provider.assign_ptr("", 0);
+  }
+  if (OB_SUCC(ret) && request_model_name_is_null) {
+    request_model_name.assign_ptr("", 0);
+  }
+  if (OB_SUCC(ret) && arguments_is_null) {
+    arguments.assign_ptr("", 0);
+  }
+  if (OB_SUCC(ret) && request_transform_fn_is_null) {
+    request_transform_fn.assign_ptr("", 0);
+  }
+  if (OB_SUCC(ret) && response_transform_fn_is_null) {
+    response_transform_fn.assign_ptr("", 0);
+  }
 
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, scope, endpoint.scope_))) {
@@ -218,6 +248,31 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   } else if (OB_FAIL(deep_copy_ob_string(allocator, arguments, endpoint.parameters_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, request_transform_fn, endpoint.request_transform_fn_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, response_transform_fn, endpoint.response_transform_fn_))) {
+  } else {
+    // [ai-enhance] deep_copy_ob_string normalizes empty strings to ptr=NULL,
+    // which makes ObDMLSqlSplicer write SQL NULL on later UPDATE (ALTER).
+    // Keep DB non-NULL empty strings as non-null so DML writes X'' instead;
+    // DB NULL columns stay NULL (ptr remains NULL) and UPDATE writes NULL.
+    if (!provider_is_null && endpoint.provider_.empty() && NULL == endpoint.provider_.ptr()) {
+      endpoint.provider_.assign_ptr(const_cast<char *>(""), 0);
+    }
+    if (!request_model_name_is_null && endpoint.request_model_name_.empty() && NULL == endpoint.request_model_name_.ptr()) {
+      endpoint.request_model_name_.assign_ptr(const_cast<char *>(""), 0);
+    }
+    if (!arguments_is_null && endpoint.parameters_.empty() && NULL == endpoint.parameters_.ptr()) {
+      endpoint.parameters_.assign_ptr(const_cast<char *>(""), 0);
+    }
+    if (!request_transform_fn_is_null && endpoint.request_transform_fn_.empty() && NULL == endpoint.request_transform_fn_.ptr()) {
+      endpoint.request_transform_fn_.assign_ptr(const_cast<char *>(""), 0);
+    }
+    if (!response_transform_fn_is_null && endpoint.response_transform_fn_.empty() && NULL == endpoint.response_transform_fn_.ptr()) {
+      endpoint.response_transform_fn_.assign_ptr(const_cast<char *>(""), 0);
+    }
+    // access_key is extracted with the strict macro (never SQL NULL), keep
+    // its empty value non-null for the ollama no-auth scenario.
+    if (endpoint.access_key_.empty() && NULL == endpoint.access_key_.ptr()) {
+      endpoint.access_key_.assign_ptr(const_cast<char *>(""), 0);
+    }
   }
 
   if (OB_SUCC(ret)) {

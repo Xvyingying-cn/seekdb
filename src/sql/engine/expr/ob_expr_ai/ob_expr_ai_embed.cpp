@@ -83,8 +83,7 @@ int ObExprAIEmbed::eval_ai_embed(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &re
   if (expr.arg_cnt_ == 3 ? OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_content, arg_dim))
                          : OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_content))) {
   } else if (arg_model_id->is_null() || arg_content->is_null()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, model id or content is null");
+    // ai-enhance: NULL 参数安静返回 NULL（与 .result 期望一致，非 batch 路径下同样成立）
     res.set_null();
   } else {
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
@@ -135,6 +134,121 @@ int ObExprAIEmbed::eval_ai_embed(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &re
   return ret;
 }
 
+// ai-enhance: batch eval merges all non-null rows into a single embedding
+// request (one HTTP call per batch). NULL rows are quietly evaluated to NULL
+// and never enter the request, so results cannot be misaligned.
+int ObExprAIEmbed::eval_ai_embed_batch(const ObExpr &expr,
+                                       ObEvalCtx &ctx,
+                                       const ObBitVector &skip,
+                                       const int64_t batch_size)
+{
+  INIT_SUCC(ret);
+  if (OB_UNLIKELY(expr.arg_cnt_ < 2 || expr.arg_cnt_ > 3)
+      || OB_ISNULL(expr.args_[0]) || OB_ISNULL(expr.args_[1])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(expr.args_[0]->eval_batch(ctx, skip, batch_size))) {
+  } else if (OB_FAIL(expr.args_[1]->eval_batch(ctx, skip, batch_size))) {
+  } else if (3 == expr.arg_cnt_ && OB_FAIL(expr.args_[2]->eval_batch(ctx, skip, batch_size))) {
+  } else {
+    ObDatum *res_datums = expr.locate_batch_datums(ctx);
+    ObBitVector &eval_flags = expr.get_evaluated_flags(ctx);
+    ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
+    MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator());
+    lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(N_AI_EMBED));
+    ObArray<ObString> contents;
+    ObArray<int64_t> row_ids;
+    ObString model_id;
+    bool model_set = false;
+    int64_t dim = 0;
+    bool dim_set = false;
+    for (int64_t i = 0; OB_SUCC(ret) && i < batch_size; ++i) {
+      if (skip.at(i) || eval_flags.at(i)) {
+        continue;
+      }
+      ObDatum &model_datum = expr.args_[0]->locate_expr_datum(ctx, i);
+      ObDatum &content_datum = expr.args_[1]->locate_expr_datum(ctx, i);
+      if (model_datum.is_null() || content_datum.is_null()) {
+        // NULL rows never enter the request and simply yield NULL
+        res_datums[i].set_null();
+        eval_flags.set(i);
+      } else if (!model_set) {
+        model_id = model_datum.get_string();
+        model_set = true;
+        if (model_id.empty() || content_datum.get_string().empty()) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, model id or input is empty");
+        } else if (3 == expr.arg_cnt_ && !expr.args_[2]->locate_expr_datum(ctx, i).is_null()) {
+          dim = expr.args_[2]->locate_expr_datum(ctx, i).get_int();
+          if (dim <= 0) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, dimension parameter must be a positive integer");
+          } else {
+            dim_set = true;
+          }
+        }
+      } else if (model_datum.get_string() != model_id) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ai_embed batch requires the same model for all rows", K(ret));
+      } else if (content_datum.get_string().empty()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, model id or input is empty");
+      } else if (3 == expr.arg_cnt_ && !expr.args_[2]->locate_expr_datum(ctx, i).is_null()) {
+        int64_t row_dim = expr.args_[2]->locate_expr_datum(ctx, i).get_int();
+        if (row_dim != dim) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, batch rows must use the same dimension");
+        }
+      } else {
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(contents.push_back(content_datum.get_string()))) {
+        } else if (OB_FAIL(row_ids.push_back(i))) {
+        }
+      }
+    }
+    if (OB_FAIL(ret) || contents.empty()) {
+      // all rows null/skip, or collected error: nothing to request
+    } else {
+      ObJsonObject *config = nullptr;
+      ObJsonInt *dim_json = nullptr;
+      ObAIFuncExprInfo *info = nullptr;
+      share::ObAiModelEndpointInfo resolved_endpoint;
+      const share::ObAiModelEndpointInfo *endpoint_info = &resolved_endpoint;
+      query::ObIAiEndpointResolver *endpoint_resolver =
+          ::oceanbase::share::server_service<::oceanbase::query::ObIAiEndpointResolver>();
+      if (dim_set && OB_FAIL(ObAIFuncJsonUtils::get_json_object(temp_allocator, config))) {
+      } else if (dim_set && OB_FAIL(ObAIFuncJsonUtils::get_json_int(temp_allocator, dim, dim_json))) {
+      } else if (dim_set && OB_FAIL(config->add("dimensions", dim_json))) {
+      } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(temp_allocator, model_id, info))) {
+      } else if (OB_ISNULL(endpoint_resolver)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(
+                     model_id, temp_allocator, resolved_endpoint))) {
+      } else {
+        ObAIFuncModel model(temp_allocator, *info, *endpoint_info);
+        ObArray<ObString> results;
+        if (OB_FAIL(model.call_dense_embedding_vector_v2(contents, config, results))) {
+        } else if (results.count() != row_ids.count()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("ai_embed batch result count mismatch", K(ret),
+                   K(contents.count()), K(results.count()));
+        } else {
+          for (int64_t k = 0; OB_SUCC(ret) && k < row_ids.count(); ++k) {
+            const int64_t row = row_ids[k];
+            ObEvalCtx::BatchInfoScopeGuard batch_info_guard(ctx);
+            batch_info_guard.set_batch_idx(row);
+            if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, res_datums[row], results[k]))) {
+            } else {
+              eval_flags.set(row);
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObExprAIEmbed::cg_expr(ObExprCGCtx &expr_cg_ctx, 
                            const ObRawExpr &raw_expr,
                            ObExpr &rt_expr) const 
@@ -170,6 +284,10 @@ int ObExprAIEmbed::cg_expr(ObExprCGCtx &expr_cg_ctx,
 
   if (OB_SUCC(ret)) {
     rt_expr.eval_func_ = ObExprAIEmbed::eval_ai_embed;
+    // [ai-enhance] 无条件注册批量 eval（参照 is_uuid 范例）：
+    // cg 阶段 is_batch_result() 尚未确定，条件判断恒 false 导致 NULL 行走单行 eval 报 1210。
+    // 框架保证仅 batch 执行时才会调用 eval_batch_func_，单行模式不受影响。
+    rt_expr.eval_batch_func_ = ObExprAIEmbed::eval_ai_embed_batch;
   }
   return ret;
 }

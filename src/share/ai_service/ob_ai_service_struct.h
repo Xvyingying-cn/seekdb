@@ -48,6 +48,7 @@ public:
     parameters_.reset();
     request_transform_fn_.reset();
     response_transform_fn_.reset();
+    max_concurrency_ = 1; // [ai-enhance] 默认 1（合法值）；0/1025 显式传入时需报 11116
     endpoint_id_ = OB_INVALID_ID;
   }
 
@@ -80,7 +81,8 @@ public:
                K_(request_model_name),
                K_(parameters),
                K_(request_transform_fn),
-               K_(response_transform_fn));
+               K_(response_transform_fn),
+               K_(max_concurrency));
 private:
   static const ObString DEFAULT_SCOPE;
   static bool is_valid_provider(const ObString &provider);
@@ -98,6 +100,7 @@ private:
   ObString parameters_;
   ObString request_transform_fn_;
   ObString response_transform_fn_;
+  int64_t max_concurrency_;
 };
 
 } // namespace share
