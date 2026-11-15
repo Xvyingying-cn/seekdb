@@ -38,6 +38,16 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include "share/system_variable/ob_sys_var_class_type.h"
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <utility>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdint.h>
+#include <dirent.h>
 
 namespace oceanbase
 {
@@ -50,6 +60,14 @@ using namespace pl;
 
 namespace sql
 {
+
+// file_sql: table functions over local files (see implementation below)
+namespace file_sql {
+int fs_rewrite(common::ObIAllocator &alloc,
+               ObSQLSessionInfo &session,
+               const common::ObString &sql_in,
+               common::ObString &sql_out);
+}
 
 const int64_t ObSql::max_error_length = 80;
 const int64_t ObSql::SQL_MEM_SIZE_LIMIT = 1024 * 1024 * 64;
@@ -1946,6 +1964,18 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   ObSQLSessionInfo &session = result.get_session();
   
   ObExecContext& ectx = result.get_exec_context();
+  ObString file_sql_rewritten;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(file_sql::fs_rewrite(allocator, session, trimed_stmt, file_sql_rewritten))) {
+    if (OB_NOT_SUPPORTED == ret || OB_ERR_PARSE_SQL == ret) {
+      // file sql disabled / unsupported usage are expected user-level errors:
+      // report them to the client and keep the connection alive, same treatment
+      // as the empty-query error above.
+      result.get_exec_context().set_need_disconnect(false);
+    }
+  } else if (!file_sql_rewritten.empty()) {
+    trimed_stmt = file_sql_rewritten;
+  }
   int get_plan_err = OB_SUCCESS; //used for judge whether add plan to plan cache
   bool use_plan_cache = session.get_local_ob_enable_plan_cache();
   ObPlanCacheCtx *pc_ctx = NULL;
@@ -4109,6 +4139,1627 @@ void ObSql::rollback_implicit_trans_when_fail(ObResultSet &result, int &ret)
   }
 }
 
+
+//////////////////////////////////////////////////////////////////////////////
+// file_sql: read_csv / read_json / read_parquet / glob table functions, COPY TO
+// Implemented as a statement rewrite layer: table functions are materialized
+// into literal derived tables so the existing engine executes them unchanged.
+//////////////////////////////////////////////////////////////////////////////
+namespace file_sql {
+
+static const char *FS_MSG_DISABLED = "file sql";
+
+inline bool fs_space(const char c)
+{
+  return ' ' == c || '\t' == c || '\n' == c || '\r' == c || '\f' == c || '\v' == c;
+}
+
+inline char fs_low(const char c)
+{
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+std::string fs_lower(const std::string &s)
+{
+  std::string r;
+  r.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) { r.push_back(fs_low(s[i])); }
+  return r;
+}
+
+std::string fs_upper(const std::string &s)
+{
+  std::string r;
+  r.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    char c = s[i];
+    r.push_back((c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c);
+  }
+  return r;
+}
+
+std::string fs_trim(const std::string &s)
+{
+  size_t b = 0;
+  size_t e = s.size();
+  while (b < e && fs_space(s[b])) { ++b; }
+  while (e > b && fs_space(s[e - 1])) { --e; }
+  return s.substr(b, e - b);
+}
+
+bool fs_starts_ci(const std::string &s, const char *kw)
+{
+  const size_t n = strlen(kw);
+  if (s.size() < n) { return false; }
+  for (size_t i = 0; i < n; ++i) {
+    if (fs_low(s[i]) != fs_low(kw[i])) { return false; }
+  }
+  return true;
+}
+
+bool fs_ident(const char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || '_' == c || '$' == c;
+}
+
+bool fs_is_int(const std::string &s, int64_t &v)
+{
+  if (s.empty()) { return false; }
+  size_t i = 0;
+  bool neg = false;
+  if ('+' == s[0] || '-' == s[0]) { neg = ('-' == s[0]); i = 1; }
+  if (i >= s.size()) { return false; }
+  int64_t r = 0;
+  for (; i < s.size(); ++i) {
+    if (s[i] < '0' || s[i] > '9') { return false; }
+    r = r * 10 + (s[i] - '0');
+    if (r > 1000000000000000LL) { return false; }
+  }
+  v = neg ? -r : r;
+  return true;
+}
+
+bool fs_is_num(const std::string &s)
+{
+  if (s.empty()) { return false; }
+  size_t i = 0;
+  if ('+' == s[0] || '-' == s[0]) { i = 1; }
+  bool digit = false;
+  bool dot = false;
+  for (; i < s.size(); ++i) {
+    if (s[i] >= '0' && s[i] <= '9') {
+      digit = true;
+    } else if ('.' == s[i] && !dot) {
+      dot = true;
+    } else {
+      return false;
+    }
+  }
+  return digit;
+}
+
+bool fs_is_date(const std::string &s)
+{
+  if (10 != s.size()) { return false; }
+  for (size_t i = 0; i < 10; ++i) {
+    if (4 == i || 7 == i) {
+      if ('-' != s[i]) { return false; }
+    } else if (s[i] < '0' || s[i] > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool fs_is_datetime(const std::string &s)
+{
+  if (s.size() < 19) { return false; }
+  if (!fs_is_date(s.substr(0, 10))) { return false; }
+  if (' ' != s[10] && 'T' != s[10] && 't' != s[10]) { return false; }
+  return ':' == s[13] && ':' == s[16];
+}
+
+bool fs_is_bool(const std::string &s)
+{
+  const std::string l = fs_lower(s);
+  return "true" == l || "false" == l;
+}
+
+bool fs_is_null_tok(const std::string &s)
+{
+  const std::string l = fs_lower(s);
+  return "null" == l;
+}
+
+enum FsType {
+  FS_T_BIGINT = 0,
+  FS_T_DOUBLE,
+  FS_T_BOOL,
+  FS_T_DATE,
+  FS_T_DATETIME,
+  FS_T_VARCHAR
+};
+
+const char *fs_type_name(const FsType t)
+{
+  switch (t) {
+    case FS_T_BIGINT: return "BIGINT";
+    case FS_T_DOUBLE: return "DOUBLE";
+    case FS_T_BOOL: return "BOOLEAN";
+    case FS_T_DATE: return "DATE";
+    case FS_T_DATETIME: return "DATETIME";
+    default: return "VARCHAR";
+  }
+}
+
+struct FsColumn {
+  std::string name;
+  FsType type;
+  bool nullable;
+  FsColumn() : type(FS_T_VARCHAR), nullable(true) {}
+};
+
+typedef std::vector<std::string> FsRow;
+
+struct FsTable {
+  std::vector<FsColumn> cols;
+  std::vector<FsRow> rows;
+};
+
+void fs_infer(FsColumn &col, const std::vector<std::string> &vals)
+{
+  bool all_bool = true;
+  bool all_int = true;
+  bool all_num = true;
+  bool all_date = true;
+  bool all_dt = true;
+  int64_t non_empty = 0;
+  col.nullable = false;
+  for (size_t i = 0; i < vals.size(); ++i) {
+    const std::string &v = vals[i];
+    if (v.empty()) {
+      col.nullable = true;
+      continue;
+    }
+    ++non_empty;
+    int64_t tmp = 0;
+    if (!fs_is_bool(v)) { all_bool = false; }
+    if (!fs_is_int(v, tmp)) { all_int = false; }
+    if (!fs_is_num(v)) { all_num = false; }
+    if (!fs_is_date(v)) { all_date = false; }
+    if (!fs_is_datetime(v)) { all_dt = false; }
+  }
+  if (0 == non_empty) {
+    col.type = FS_T_VARCHAR;
+  } else if (all_bool) {
+    col.type = FS_T_BOOL;
+  } else if (all_int) {
+    col.type = FS_T_BIGINT;
+  } else if (all_num) {
+    col.type = FS_T_DOUBLE;
+  } else if (all_date) {
+    col.type = FS_T_DATE;
+  } else if (all_dt) {
+    col.type = FS_T_DATETIME;
+  } else {
+    col.type = FS_T_VARCHAR;
+  }
+}
+
+std::string fs_quote(const std::string &v)
+{
+  std::string r;
+  r.reserve(v.size() + 2);
+  r.push_back('\'');
+  for (size_t i = 0; i < v.size(); ++i) {
+    const char c = v[i];
+    if ('\\' == c) {
+      r += "\\\\";
+    } else if ('\'' == c) {
+      r += "\\'";
+    } else {
+      r.push_back(c);
+    }
+  }
+  r.push_back('\'');
+  return r;
+}
+
+std::string fs_literal(const std::string &v, const FsType t)
+{
+  if (v.empty()) { return "NULL"; }
+  switch (t) {
+    case FS_T_BOOL: return fs_is_bool(v) && "true" == fs_lower(v) ? "1" : (fs_is_bool(v) ? "0" : v);
+    case FS_T_BIGINT: return v;
+    case FS_T_DOUBLE:
+      // force a DOUBLE literal: keeps the union column DOUBLE so values render
+      // as raw text (87 not 87.0) and aggregates stay exact (90.25 not 90.3)
+      return (std::string::npos == v.find('e') && std::string::npos == v.find('E')) ? v + "e0" : v;
+    case FS_T_DATETIME: {
+      std::string s = v;
+      if (s.size() > 10 && ('T' == s[10] || 't' == s[10])) { s[10] = ' '; }
+      return fs_quote(s);
+    }
+    default: return fs_quote(v);
+  }
+}
+
+int fs_read_all(const std::string &path, std::string &content)
+{
+  int ret = 0;
+  FILE *fp = fopen(path.c_str(), "rb");
+  if (NULL == fp) {
+    ret = -1;
+  } else {
+    char buf[65536];
+    size_t n = 0;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+      content.append(buf, n);
+      if (content.size() > 64LL * 1024 * 1024) { break; }
+    }
+    fclose(fp);
+  }
+  return ret;
+}
+
+// ------------------------------------------------------------------ CSV
+int fs_parse_csv(const std::string &content, FsTable &t)
+{
+  int ret = 0;
+  std::vector<FsRow> raw;
+  FsRow row;
+  std::string field;
+  bool in_quote = false;
+  bool row_started = false;
+  size_t i = 0;
+  while (i < content.size()) {
+    const char c = content[i];
+    if (in_quote) {
+      if ('"' == c) {
+        if (i + 1 < content.size() && '"' == content[i + 1]) {
+          field.push_back('"');
+          i += 2;
+        } else {
+          in_quote = false;
+          ++i;
+        }
+      } else {
+        field.push_back(c);
+        ++i;
+      }
+    } else if ('"' == c) {
+      in_quote = true;
+      row_started = true;
+      ++i;
+    } else if (',' == c) {
+      row.push_back(field);
+      field.clear();
+      row_started = true;
+      ++i;
+    } else if ('\n' == c || '\r' == c) {
+      row.push_back(field);
+      field.clear();
+      raw.push_back(row);
+      row.clear();
+      row_started = false;
+      if ('\r' == c && i + 1 < content.size() && '\n' == content[i + 1]) { ++i; }
+      ++i;
+    } else {
+      field.push_back(c);
+      row_started = true;
+      ++i;
+    }
+  }
+  if (row_started || !field.empty() || !row.empty()) {
+    row.push_back(field);
+    raw.push_back(row);
+  }
+  if (!raw.empty()) {
+    FsRow &head = raw[0];
+    for (size_t c = 0; c < head.size(); ++c) {
+      std::string nm = fs_trim(head[c]);
+      if (nm.empty()) { nm = "column" + std::to_string(c); }
+      std::string cand = nm;
+      int dup = 1;
+      bool clash = true;
+      while (clash) {
+        clash = false;
+        for (size_t k = 0; k < t.cols.size(); ++k) {
+          if (t.cols[k].name == cand) { clash = true; break; }
+        }
+        if (clash) {
+          ++dup;
+          cand = nm + "__" + std::to_string(dup);
+        }
+      }
+      FsColumn col;
+      col.name = cand;
+      t.cols.push_back(col);
+    }
+    for (size_t r = 1; r < raw.size(); ++r) {
+      FsRow out;
+      out.resize(t.cols.size());
+      for (size_t c = 0; c < t.cols.size(); ++c) {
+        out[c] = c < raw[r].size() ? fs_trim(raw[r][c]) : std::string();
+      }
+      t.rows.push_back(out);
+    }
+    for (size_t c = 0; c < t.cols.size(); ++c) {
+      std::vector<std::string> vals;
+      vals.reserve(t.rows.size());
+      for (size_t r = 0; r < t.rows.size(); ++r) { vals.push_back(t.rows[r][c]); }
+      fs_infer(t.cols[c], vals);
+    }
+  }
+  return ret;
+}
+
+// ---------------------------------------------------------------- JSONL
+void fs_json_unescape(const std::string &in, std::string &out)
+{
+  for (size_t i = 0; i < in.size(); ++i) {
+    if ('\\' == in[i] && i + 1 < in.size()) {
+      const char n = in[i + 1];
+      switch (n) {
+        case 'n': out.push_back('\n'); ++i; break;
+        case 't': out.push_back('\t'); ++i; break;
+        case 'r': out.push_back('\r'); ++i; break;
+        case '"': out.push_back('"'); ++i; break;
+        case '\\': out.push_back('\\'); ++i; break;
+        case '/': out.push_back('/'); ++i; break;
+        default: out.push_back(in[i]); break;
+      }
+    } else {
+      out.push_back(in[i]);
+    }
+  }
+}
+
+// parse one flat JSON object: returns key/value pairs
+int fs_parse_json_obj(const std::string &line,
+                      std::vector<std::pair<std::string, std::string> > &kv)
+{
+  int ret = 0;
+  size_t i = 0;
+  const size_t n = line.size();
+  while (i < n && fs_space(line[i])) { ++i; }
+  if (i >= n || '{' != line[i]) { return -1; }
+  ++i;
+  while (i < n) {
+    while (i < n && (fs_space(line[i]) || ',' == line[i])) { ++i; }
+    if (i >= n || '}' == line[i]) { break; }
+    if ('"' != line[i]) { ret = -1; break; }
+    ++i;
+    std::string key;
+    while (i < n && '"' != line[i]) {
+      if ('\\' == line[i] && i + 1 < n) {
+        std::string esc = line.substr(i, 2);
+        std::string un;
+        fs_json_unescape(esc, un);
+        key += un;
+        i += 2;
+      } else {
+        key.push_back(line[i]);
+        ++i;
+      }
+    }
+    if (i < n) { ++i; }
+    while (i < n && fs_space(line[i])) { ++i; }
+    if (i < n && ':' == line[i]) { ++i; }
+    std::string val;
+    bool is_null = false;
+    while (i < n && fs_space(line[i])) { ++i; }
+    if (i < n && '"' == line[i]) {
+      ++i;
+      std::string raw;
+      while (i < n && '"' != line[i]) {
+        if ('\\' == line[i] && i + 1 < n) {
+          raw.append(line, i, 2);
+          i += 2;
+        } else {
+          raw.push_back(line[i]);
+          ++i;
+        }
+      }
+      if (i < n) { ++i; }
+      fs_json_unescape(raw, val);
+    } else {
+      std::string tok;
+      while (i < n && ',' != line[i] && '}' != line[i]) {
+        tok.push_back(line[i]);
+        ++i;
+      }
+      tok = fs_trim(tok);
+      if (fs_is_null_tok(tok)) {
+        is_null = true;
+      } else {
+        val = tok;
+      }
+    }
+    kv.push_back(std::make_pair(key, is_null ? std::string() : val));
+  }
+  return ret;
+}
+
+int fs_parse_jsonl(const std::string &content, FsTable &t)
+{
+  std::vector<std::vector<std::pair<std::string, std::string> > > objs;
+  std::vector<std::string> keys;
+  size_t pos = 0;
+  while (pos <= content.size()) {
+    size_t nl = content.find('\n', pos);
+    if (std::string::npos == nl) { nl = content.size(); }
+    const std::string line = fs_trim(content.substr(pos, nl - pos));
+    pos = nl + 1;
+    if (line.empty()) { continue; }
+    std::vector<std::pair<std::string, std::string> > kv;
+    if (0 != fs_parse_json_obj(line, kv)) { continue; }
+    for (size_t i = 0; i < kv.size(); ++i) {
+      bool found = false;
+      for (size_t k = 0; k < keys.size(); ++k) {
+        if (keys[k] == kv[i].first) { found = true; break; }
+      }
+      if (!found) { keys.push_back(kv[i].first); }
+    }
+    objs.push_back(kv);
+  }
+  for (size_t i = 0; i < keys.size(); ++i) {
+    FsColumn col;
+    col.name = keys[i];
+    t.cols.push_back(col);
+  }
+  for (size_t r = 0; r < objs.size(); ++r) {
+    FsRow row;
+    row.resize(keys.size());
+    for (size_t k = 0; k < keys.size(); ++k) {
+      for (size_t j = 0; j < objs[r].size(); ++j) {
+        if (objs[r][j].first == keys[k]) {
+          row[k] = objs[r][j].second;
+          break;
+        }
+      }
+    }
+    t.rows.push_back(row);
+  }
+  for (size_t c = 0; c < t.cols.size(); ++c) {
+    std::vector<std::string> vals;
+    for (size_t r = 0; r < t.rows.size(); ++r) { vals.push_back(t.rows[r][c]); }
+    fs_infer(t.cols[c], vals);
+  }
+  return 0;
+}
+
+// ----------------------------------------------------------------- glob
+bool fs_match(const char *pat, const char *name)
+{
+  if ('\0' == *pat) { return '\0' == *name; }
+  if ('*' == *pat) {
+    for (const char *p = name; ; ++p) {
+      if (fs_match(pat + 1, p)) { return true; }
+      if ('\0' == *p) { return false; }
+    }
+  }
+  if ('?' == *pat) {
+    return '\0' != *name && fs_match(pat + 1, name + 1);
+  }
+  return *pat == *name && fs_match(pat + 1, name + 1);
+}
+
+int fs_glob(const std::string &pattern, FsTable &t)
+{
+  int ret = 0;
+  std::string dir;
+  std::string pat;
+  const size_t slash = pattern.find_last_of('/');
+  if (std::string::npos == slash) {
+    dir = ".";
+    pat = pattern;
+  } else {
+    dir = pattern.substr(0, slash);
+    if (dir.empty()) { dir = "/"; }
+    pat = pattern.substr(slash + 1);
+  }
+  FsColumn col;
+  col.name = "file";
+  col.type = FS_T_VARCHAR;
+  col.nullable = false;
+  t.cols.push_back(col);
+  DIR *dp = opendir(dir.c_str());
+  if (NULL == dp) {
+    ret = -1;
+  } else {
+    struct dirent *ent = NULL;
+    std::vector<std::string> names;
+    while (NULL != (ent = readdir(dp))) {
+      if (0 == strcmp(ent->d_name, ".") || 0 == strcmp(ent->d_name, "..")) { continue; }
+      if (fs_match(pat.c_str(), ent->d_name)) { names.push_back(ent->d_name); }
+    }
+    closedir(dp);
+    std::sort(names.begin(), names.end());
+    for (size_t i = 0; i < names.size(); ++i) {
+      FsRow row;
+      std::string full = dir;
+      if (full.empty() || '/' != full[full.size() - 1]) { full += "/"; }
+      full += names[i];
+      row.push_back(full);
+      t.rows.push_back(row);
+    }
+  }
+  return ret;
+}
+
+// -------------------------------------------------------------- parquet
+class FsThrift
+{
+public:
+  FsThrift(const unsigned char *d, const size_t n) : d_(d), n_(n), p_(0), last_(0) {}
+  bool ok() const { return p_ <= n_; }
+  size_t pos() const { return p_; }
+  void seek(const size_t p) { p_ = p; }
+  void enter_struct(int64_t &save) { save = last_; last_ = 0; }
+  void exit_struct(const int64_t save) { last_ = save; }
+  unsigned char u8()
+  {
+    unsigned char v = 0;
+    if (p_ < n_) { v = d_[p_++]; } else { p_ = n_ + 1; }
+    return v;
+  }
+  uint64_t varint()
+  {
+    uint64_t r = 0;
+    int sh = 0;
+    while (p_ < n_ && sh < 64) {
+      const unsigned char x = u8();
+      r |= static_cast<uint64_t>(x & 0x7f) << sh;
+      if (!(x & 0x80)) { break; }
+      sh += 7;
+    }
+    return r;
+  }
+  int64_t zigzag()
+  {
+    const uint64_t v = varint();
+    return static_cast<int64_t>((v >> 1) ^ (~(v & 1) + 1));
+  }
+  int field(int &fid)
+  {
+    if (p_ >= n_) { return 0; }
+    const unsigned char h = u8();
+    if (0 == h) { return 0; }
+    const int typ = h & 0x0f;
+    const int delta = (h & 0xf0) >> 4;
+    if (0 == delta) {
+      fid = static_cast<int>(zigzag());
+    } else {
+      fid = static_cast<int>(last_ + delta);
+    }
+    last_ = fid;
+    return typ;
+  }
+  std::string binary()
+  {
+    const uint64_t n = varint();
+    std::string s;
+    if (p_ + n <= n_) {
+      s.assign(reinterpret_cast<const char *>(d_ + p_), static_cast<size_t>(n));
+      p_ += n;
+    } else {
+      p_ = n_ + 1;
+    }
+    return s;
+  }
+  void lhead(int &count, int &etype)
+  {
+    const unsigned char h = u8();
+    count = (h >> 4) & 0x0f;
+    etype = h & 0x0f;
+    if (15 == count) { count = static_cast<int>(varint()); }
+  }
+  void skip(const int typ)
+  {
+    switch (typ) {
+      case 1: case 2: break;
+      case 3: u8(); break;
+      case 4: case 5: case 6: varint(); break;
+      case 7: p_ += 8; break;
+      case 8: binary(); break;
+      case 9: case 10: {
+        int cnt = 0;
+        int et = 0;
+        lhead(cnt, et);
+        for (int i = 0; i < cnt; ++i) { skip(et); }
+        break;
+      }
+      case 11: {
+        const int cnt = static_cast<int>(varint());
+        if (cnt > 0) {
+          const unsigned char kv = u8();
+          for (int i = 0; i < cnt; ++i) { skip(kv & 0x0f); skip((kv >> 4) & 0x0f); }
+        }
+        break;
+      }
+      case 12: {
+        const int64_t save = last_;
+        last_ = 0;
+        int fid = 0;
+        int ft = 0;
+        while (0 != (ft = field(fid))) { skip(ft); }
+        last_ = save;
+        break;
+      }
+      default: p_ = n_ + 1; break;
+    }
+  }
+private:
+  const unsigned char *d_;
+  size_t n_;
+  size_t p_;
+  int64_t last_;
+};
+
+bool fs_snappy(const unsigned char *in, const size_t in_len, std::string &out)
+{
+  size_t ip = 0;
+  uint64_t expected = 0;
+  int sh = 0;
+  bool got_len = false;
+  while (ip < in_len && sh < 64) {
+    const unsigned char b = in[ip++];
+    expected |= static_cast<uint64_t>(b & 0x7f) << sh;
+    if (!(b & 0x80)) { got_len = true; break; }
+    sh += 7;
+  }
+  if (!got_len) { return false; }
+  out.clear();
+  out.reserve(expected);
+  while (ip < in_len && out.size() < expected) {
+    const unsigned char tag = in[ip++];
+    const int t = tag & 0x03;
+    if (0 == t) {
+      uint64_t len = (tag >> 2) + 1;
+      if (len > 60) {
+        const uint64_t extra = len - 60;
+        if (ip + extra > in_len) { return false; }
+        uint64_t l = 0;
+        for (uint64_t i = 0; i < extra; ++i) { l |= static_cast<uint64_t>(in[ip + i]) << (8 * i); }
+        ip += extra;
+        len = l + 1;
+      }
+      if (ip + len > in_len) { return false; }
+      out.append(reinterpret_cast<const char *>(in + ip), static_cast<size_t>(len));
+      ip += len;
+    } else {
+      uint64_t len = 0;
+      uint64_t off = 0;
+      if (1 == t) {
+        len = ((tag >> 2) & 0x07) + 4;
+        if (ip >= in_len) { return false; }
+        off = (static_cast<uint64_t>(tag & 0xe0) << 3) | in[ip++];
+      } else if (2 == t) {
+        len = (tag >> 2) + 1;
+        if (ip + 2 > in_len) { return false; }
+        off = in[ip] | (static_cast<uint64_t>(in[ip + 1]) << 8);
+        ip += 2;
+      } else {
+        len = (tag >> 2) + 1;
+        if (ip + 4 > in_len) { return false; }
+        off = in[ip] | (static_cast<uint64_t>(in[ip + 1]) << 8) |
+              (static_cast<uint64_t>(in[ip + 2]) << 16) |
+              (static_cast<uint64_t>(in[ip + 3]) << 24);
+        ip += 4;
+      }
+      if (0 == off || off > out.size()) { return false; }
+      for (uint64_t i = 0; i < len; ++i) {
+        out.push_back(out[out.size() - off]);
+      }
+    }
+  }
+  return out.size() == expected;
+}
+
+void fs_rle_levels(const unsigned char *d, const size_t n, const int bit_width,
+                   std::vector<int> &levels, const size_t want)
+{
+  size_t p = 0;
+  while (p < n && levels.size() < want) {
+    uint64_t header = 0;
+    int sh = 0;
+    while (p < n && sh < 64) {
+      const unsigned char b = d[p++];
+      header |= static_cast<uint64_t>(b & 0x7f) << sh;
+      if (!(b & 0x80)) { break; }
+      sh += 7;
+    }
+    if (header & 1) {
+      const size_t groups = static_cast<size_t>(header >> 1);
+      const size_t nvals = groups * 8;
+      const size_t nbytes = (nvals * bit_width + 7) / 8;
+      if (p + nbytes > n) { break; }
+      for (size_t i = 0; i < nvals && levels.size() < want; ++i) {
+        int v = 0;
+        const size_t bit = i * bit_width;
+        for (int b = 0; b < bit_width; ++b) {
+          const size_t bp = bit + b;
+          if (d[p + bp / 8] & (1 << (bp % 8))) { v |= (1 << b); }
+        }
+        levels.push_back(v);
+      }
+      p += nbytes;
+    } else {
+      const size_t run = static_cast<size_t>(header >> 1);
+      const size_t nbytes = (bit_width + 7) / 8;
+      if (p + nbytes > n) { break; }
+      int v = 0;
+      for (size_t i = 0; i < nbytes; ++i) { v |= static_cast<int>(d[p + i]) << (8 * i); }
+      p += nbytes;
+      for (size_t i = 0; i < run && levels.size() < want; ++i) { levels.push_back(v); }
+    }
+  }
+}
+
+struct FsParquetCol {
+  std::string name;
+  int phys;
+  int codec;
+  int64_t num_values;
+  int64_t data_off;
+  int max_def;
+  FsParquetCol() : phys(-1), codec(0), num_values(0), data_off(0), max_def(0) {}
+};
+
+int fs_read_parquet(const std::string &path, FsTable &t)
+{
+  int ret = 0;
+  std::string content;
+  if (0 != fs_read_all(path, content)) {
+    ret = -1;
+  } else if (content.size() < 12) {
+    ret = -1;
+  } else {
+    const unsigned char *d = reinterpret_cast<const unsigned char *>(content.data());
+    const size_t n = content.size();
+    if (0 != memcmp(d, "PAR1", 4) || 0 != memcmp(d + n - 4, "PAR1", 4)) {
+      ret = -1;
+    }
+    const uint32_t flen = static_cast<uint32_t>(d[n - 8]) |
+                          (static_cast<uint32_t>(d[n - 7]) << 8) |
+                          (static_cast<uint32_t>(d[n - 6]) << 16) |
+                          (static_cast<uint32_t>(d[n - 5]) << 24);
+    if (0 == ret && (flen + 8 > n)) {
+      ret = -1;
+    }
+    if (0 == ret) {
+      FsThrift ft(d + n - 8 - flen, flen);
+      std::vector<std::string> schema_names;
+      int leaf_idx = 0;
+      std::vector<FsParquetCol> pcols;
+      int fid = 0;
+      int typ = 0;
+      while (0 != (typ = ft.field(fid))) {
+        if (2 == fid && 9 == typ) {
+          int cnt = 0;
+          int et = 0;
+          ft.lhead(cnt, et);
+          for (int i = 0; i < cnt; ++i) {
+            std::string name;
+            int rep = 0;
+            int children = -1;
+            int64_t stype = -1;
+            int64_t sfsave = 0;
+            int sfid = 0;
+            int styp = 0;
+            ft.enter_struct(sfsave);
+            while (0 != (styp = ft.field(sfid))) {
+              if (4 == sfid && 8 == styp) {
+                name = ft.binary();
+              } else if (3 == sfid && (5 == styp || 4 == styp)) {
+                rep = static_cast<int>(ft.zigzag());
+              } else if (5 == sfid && (5 == styp || 4 == styp)) {
+                children = static_cast<int>(ft.zigzag());
+              } else if (1 == sfid && (5 == styp || 4 == styp)) {
+                stype = ft.zigzag();
+              } else {
+                ft.skip(styp);
+              }
+            }
+            ft.exit_struct(sfsave);
+            if (children < 0) {
+              FsParquetCol pc;
+              pc.name = name;
+              pc.phys = static_cast<int>(stype);
+              pc.max_def = (rep >= 1) ? 1 : 0;
+              (void)leaf_idx;
+              pcols.push_back(pc);
+            }
+          }
+        } else if (4 == fid && 9 == typ) {
+          int cnt = 0;
+          int et = 0;
+          ft.lhead(cnt, et);
+          for (int i = 0; i < cnt; ++i) {
+            int64_t rfsave = 0;
+            int rfid = 0;
+            int rtyp = 0;
+            ft.enter_struct(rfsave);
+            while (0 != (rtyp = ft.field(rfid))) {
+              if (1 == rfid && 9 == rtyp) {
+                int ccnt = 0;
+                int cet = 0;
+                ft.lhead(ccnt, cet);
+                int col = 0;
+                for (int c = 0; c < ccnt; ++c) {
+                  int64_t cfsave = 0;
+                  int cfid = 0;
+                  int ctyp = 0;
+                  ft.enter_struct(cfsave);
+                  while (0 != (ctyp = ft.field(cfid))) {
+                    if (3 == cfid && 12 == ctyp) {
+                      int64_t mfsave = 0;
+                      int mfid = 0;
+                      int mtyp = 0;
+                      ft.enter_struct(mfsave);
+                      while (0 != (mtyp = ft.field(mfid))) {
+                        if (4 == mfid) {
+                          if (col < static_cast<int>(pcols.size())) { pcols[col].codec = static_cast<int>(ft.zigzag()); }
+                        } else if (5 == mfid) {
+                          if (col < static_cast<int>(pcols.size())) { pcols[col].num_values = ft.zigzag(); }
+                        } else if (9 == mfid) {
+                          if (col < static_cast<int>(pcols.size())) { pcols[col].data_off = ft.zigzag(); }
+                        } else {
+                          ft.skip(mtyp);
+                        }
+                      }
+                      ft.exit_struct(mfsave);
+                    } else {
+                      ft.skip(ctyp);
+                    }
+                  }
+                  ft.exit_struct(cfsave);
+                  ++col;
+                }
+              } else {
+                ft.skip(rtyp);
+              }
+            }
+            ft.exit_struct(rfsave);
+          }
+        } else {
+          ft.skip(typ);
+        }
+      }
+      if (pcols.empty()) {
+        ret = -1;
+      }
+      for (size_t c = 0; 0 == ret && c < pcols.size(); ++c) {
+        FsColumn col;
+        col.name = pcols[c].name;
+        t.cols.push_back(col);
+      }
+      std::vector<std::vector<std::string> > col_vals(pcols.size());
+      for (size_t c = 0; 0 == ret && c < pcols.size(); ++c) {
+        FsThrift ph(d, n);
+        ph.seek(static_cast<size_t>(pcols[c].data_off));
+        int64_t collected = 0;
+        while (collected < pcols[c].num_values && 0 == ret) {
+          int pfid = 0;
+          int ptyp = 0;
+          int page_type = -1;
+          int uncomp = 0;
+          int comp = 0;
+          int v2_num_values = -1;
+          int v2_num_nulls = 0;
+          int v2_encoding = 0;
+          int v2_def_len = 0;
+          int v2_rep_len = 0;
+          bool v2_is_comp = true;
+          int v1_num_values = -1;
+          int v1_encoding = 0;
+          int v1_def_enc = 0;
+          while (0 != (ptyp = ph.field(pfid))) {
+            if (1 == pfid) {
+              page_type = static_cast<int>(ph.zigzag());
+            } else if (2 == pfid) {
+              uncomp = static_cast<int>(ph.zigzag());
+            } else if (3 == pfid) {
+              comp = static_cast<int>(ph.zigzag());
+            } else if (5 == pfid && 12 == ptyp) {
+              int64_t vfsave = 0;
+              int hfid = 0;
+              int htyp = 0;
+              ph.enter_struct(vfsave);
+              while (0 != (htyp = ph.field(hfid))) {
+                if (1 == hfid) {
+                  v1_num_values = static_cast<int>(ph.zigzag());
+                } else if (2 == hfid) {
+                  v1_encoding = static_cast<int>(ph.zigzag());
+                } else if (3 == hfid) {
+                  v1_def_enc = static_cast<int>(ph.zigzag());
+                } else {
+                  ph.skip(htyp);
+                }
+              }
+              ph.exit_struct(vfsave);
+            } else if (8 == pfid && 12 == ptyp) {
+              int64_t vfsave2 = 0;
+              int hfid = 0;
+              int htyp = 0;
+              ph.enter_struct(vfsave2);
+              while (0 != (htyp = ph.field(hfid))) {
+                if (1 == hfid) {
+                  v2_num_values = static_cast<int>(ph.zigzag());
+                } else if (2 == hfid) {
+                  v2_num_nulls = static_cast<int>(ph.zigzag());
+                } else if (4 == hfid) {
+                  v2_encoding = static_cast<int>(ph.zigzag());
+                } else if (5 == hfid) {
+                  v2_def_len = static_cast<int>(ph.zigzag());
+                } else if (6 == hfid) {
+                  v2_rep_len = static_cast<int>(ph.zigzag());
+                } else if (7 == hfid) {
+                  // thrift compact bool: the value is the field type itself
+                  // (1 = true, 2 = false), there is NO extra byte to read.
+                  v2_is_comp = (1 == htyp);
+                } else {
+                  ph.skip(htyp);
+                }
+              }
+              ph.exit_struct(vfsave2);
+            } else {
+              ph.skip(ptyp);
+            }
+          }
+          const size_t body_off = ph.pos();
+          if (!ph.ok() || body_off + comp > n) {
+            ret = -1;
+            break;
+          }
+          const unsigned char *body = d + body_off;
+          std::string vals;
+          std::vector<int> defs;
+          size_t values_bytes = 0;
+          if (3 == page_type) {
+            const int nvals = (v2_num_values >= 0) ? v2_num_values : v2_num_nulls;
+            const size_t levels_len = static_cast<size_t>(v2_rep_len) + static_cast<size_t>(v2_def_len);
+            if (levels_len > static_cast<size_t>(comp)) {
+              ret = -1;
+              break;
+            }
+            const int bw = (pcols[c].max_def > 0) ? 1 : 0;
+            if (bw > 0 && v2_def_len > 0) {
+              fs_rle_levels(body + v2_rep_len, v2_def_len, bw, defs,
+                            static_cast<size_t>(nvals >= 0 ? nvals : 0));
+            }
+            const unsigned char *vsrc = body + levels_len;
+            const size_t vlen = static_cast<size_t>(comp) - levels_len;
+            if (0 != pcols[c].codec && v2_is_comp) {
+              if (!fs_snappy(vsrc, vlen, vals)) { ret = -1; break; }
+            } else {
+              vals.assign(reinterpret_cast<const char *>(vsrc), vlen);
+            }
+            values_bytes = vals.size();
+            collected += (nvals >= 0 ? nvals : 0);
+          } else if (0 == page_type) {
+            const unsigned char *vsrc = body;
+            size_t vlen = static_cast<size_t>(comp);
+            std::string dec;
+            if (0 != pcols[c].codec) {
+              if (!fs_snappy(body, static_cast<size_t>(comp), dec)) { ret = -1; break; }
+              vsrc = reinterpret_cast<const unsigned char *>(dec.data());
+              vlen = dec.size();
+              (void)uncomp;
+            }
+            size_t off = 0;
+            if (pcols[c].max_def > 0) {
+              if (vlen < 4) { ret = -1; break; }
+              const uint32_t dl = static_cast<uint32_t>(vsrc[0]) |
+                                  (static_cast<uint32_t>(vsrc[1]) << 8) |
+                                  (static_cast<uint32_t>(vsrc[2]) << 16) |
+                                  (static_cast<uint32_t>(vsrc[3]) << 24);
+              off = 4;
+              if (off + dl > vlen) { ret = -1; break; }
+              if (3 == v1_def_enc || 1 == v1_def_enc || 2 == v1_def_enc) {
+                fs_rle_levels(vsrc + off, dl, 1, defs,
+                              static_cast<size_t>(v1_num_values >= 0 ? v1_num_values : 0));
+              }
+              off += dl;
+            }
+            (void)v1_encoding;
+            vals.assign(reinterpret_cast<const char *>(vsrc + off), vlen - off);
+            values_bytes = vals.size();
+            collected += (v1_num_values >= 0 ? v1_num_values : 0);
+          } else {
+            break;
+          }
+          const size_t vsize =
+              (2 == pcols[c].phys) ? 8 : ((1 == pcols[c].phys) ? 4 : ((5 == pcols[c].phys || 4 == pcols[c].phys) ? 8 : 0));
+          size_t vpos = 0;
+          const size_t nvals = (defs.empty() ? values_bytes / (vsize > 0 ? vsize : 1) : defs.size());
+          for (size_t i = 0; i < nvals; ++i) {
+            bool is_null = false;
+            if (!defs.empty()) {
+              is_null = (defs[i] < pcols[c].max_def);
+            }
+            if (is_null) {
+              col_vals[c].push_back(std::string());
+              continue;
+            }
+            if (vpos + vsize > values_bytes || 0 == vsize) {
+              col_vals[c].push_back(std::string());
+              continue;
+            }
+            char buf[64];
+            if (1 == pcols[c].phys || 2 == pcols[c].phys) {
+              int64_t v = 0;
+              if (4 == vsize) {
+                int32_t x = 0;
+                memcpy(&x, vals.data() + vpos, 4);
+                v = x;
+              } else {
+                memcpy(&v, vals.data() + vpos, 8);
+              }
+              snprintf(buf, sizeof(buf), "%ld", static_cast<long>(v));
+            } else if (5 == pcols[c].phys) {
+              double dv = 0;
+              memcpy(&dv, vals.data() + vpos, 8);
+              snprintf(buf, sizeof(buf), "%.17g", dv);
+            } else if (4 == pcols[c].phys) {
+              float fv = 0;
+              memcpy(&fv, vals.data() + vpos, 4);
+              snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(fv));
+            } else {
+              buf[0] = '\0';
+            }
+            vpos += vsize;
+            col_vals[c].push_back(std::string(buf));
+          }
+        }
+      }
+      if (0 == ret) {
+        size_t rows = 0;
+        for (size_t c = 0; c < col_vals.size(); ++c) {
+          if (col_vals[c].size() > rows) { rows = col_vals[c].size(); }
+        }
+        for (size_t r = 0; r < rows; ++r) {
+          FsRow row;
+          for (size_t c = 0; c < t.cols.size(); ++c) {
+            row.push_back(r < col_vals[c].size() ? col_vals[c][r] : std::string());
+          }
+          t.rows.push_back(row);
+        }
+        for (size_t c = 0; c < t.cols.size(); ++c) {
+          t.cols[c].type = (5 == pcols[c].phys || 4 == pcols[c].phys) ? FS_T_DOUBLE : FS_T_BIGINT;
+          t.cols[c].nullable = (0 == pcols[c].max_def) ? false : true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// ------------------------------------------------------------ sql render
+std::string fs_col_ref(const std::string &name)
+{
+  return "`" + name + "`";
+}
+
+std::string fs_table_sql(const FsTable &t)
+{
+  std::string out = "(select ";
+  if (t.cols.empty()) { return "(select 1 as x)"; }
+  if (t.rows.empty()) {
+    for (size_t c = 0; c < t.cols.size(); ++c) {
+      if (c > 0) { out += ", "; }
+      out += "NULL as " + fs_col_ref(t.cols[c].name);
+    }
+    out += " from (select 1 as x) __fs_empty where 1 = 0)";
+    return out;
+  }
+  for (size_t r = 0; r < t.rows.size(); ++r) {
+    if (r > 0) { out += " union all select "; }
+    for (size_t c = 0; c < t.cols.size(); ++c) {
+      if (c > 0) { out += ", "; }
+      out += fs_literal(t.rows[r][c], t.cols[c].type);
+      if (0 == r) { out += " as " + fs_col_ref(t.cols[c].name); }
+    }
+  }
+  out += ")";
+  return out;
+}
+
+std::string fs_desc_sql(const FsTable &t)
+{
+  std::string out = "select ";
+  for (size_t r = 0; r < t.cols.size(); ++r) {
+    if (r > 0) { out += " union all select "; }
+    out += fs_quote(t.cols[r].name) + " as column_name, " +
+           fs_quote(fs_type_name(t.cols[r].type)) + " as column_type, " +
+           std::string(t.cols[r].nullable ? "'YES'" : "'NO'") + " as `null`, " +
+           "NULL as `key`, NULL as `default`, NULL as extra";
+  }
+  return out;
+}
+
+// --------------------------------------------------------------- parsing
+struct FsCall {
+  size_t begin;
+  size_t end;
+  std::string name;
+  std::vector<std::string> pos;
+  std::vector<std::pair<std::string, std::string> > named;
+  FsCall() : begin(0), end(0) {}
+};
+
+bool fs_find_matching(const std::string &s, const size_t open, size_t &close)
+{
+  bool in_q = false;
+  int depth = 0;
+  for (size_t i = open; i < s.size(); ++i) {
+    const char c = s[i];
+    if (in_q) {
+      if ('\'' == c) {
+        if (i + 1 < s.size() && '\'' == s[i + 1]) { ++i; } else { in_q = false; }
+      } else if ('\\' == c) {
+        ++i;
+      }
+    } else if ('\'' == c) {
+      in_q = true;
+    } else if ('(' == c) {
+      ++depth;
+    } else if (')' == c) {
+      --depth;
+      if (0 == depth) { close = i; return true; }
+    }
+  }
+  return false;
+}
+
+std::string fs_unquote(const std::string &s)
+{
+  const std::string t = fs_trim(s);
+  if (t.size() >= 2 && '\'' == t[0] && '\'' == t[t.size() - 1]) {
+    std::string r;
+    for (size_t i = 1; i + 1 < t.size(); ++i) {
+      if ('\'' == t[i] && i + 2 < t.size() && '\'' == t[i + 1]) {
+        r.push_back('\'');
+        ++i;
+      } else if ('\\' == t[i] && i + 1 < t.size() - 1) {
+        const char n = t[i + 1];
+        if ('n' == n) { r.push_back('\n'); ++i; }
+        else if ('t' == n) { r.push_back('\t'); ++i; }
+        else if ('r' == n) { r.push_back('\r'); ++i; }
+        else { r.push_back(n); ++i; }
+      } else {
+        r.push_back(t[i]);
+      }
+    }
+    return r;
+  }
+  return t;
+}
+
+void fs_split_args(const std::string &body, std::vector<std::string> &args)
+{
+  std::string cur;
+  bool in_q = false;
+  int depth = 0;
+  for (size_t i = 0; i < body.size(); ++i) {
+    const char c = body[i];
+    if (in_q) {
+      cur.push_back(c);
+      if ('\'' == c) {
+        if (i + 1 < body.size() && '\'' == body[i + 1]) { cur.push_back(body[i + 1]); ++i; } else { in_q = false; }
+      } else if ('\\' == c && i + 1 < body.size()) {
+        cur.push_back(body[++i]);
+      }
+    } else if ('\'' == c) {
+      in_q = true;
+      cur.push_back(c);
+    } else if ('(' == c) {
+      ++depth;
+      cur.push_back(c);
+    } else if (')' == c) {
+      --depth;
+      cur.push_back(c);
+    } else if (',' == c && 0 == depth) {
+      args.push_back(fs_trim(cur));
+      cur.clear();
+    } else {
+      cur.push_back(c);
+    }
+  }
+  if (!fs_trim(cur).empty()) { args.push_back(fs_trim(cur)); }
+}
+
+bool fs_parse_call_at(const std::string &sql, const size_t name_pos, FsCall &call)
+{
+  size_t p = name_pos;
+  while (p < sql.size() && fs_ident(sql[p])) { ++p; }
+  if (p >= sql.size()) { return false; }
+  size_t open = p;
+  while (open < sql.size() && fs_space(sql[open])) { ++open; }
+  if (open >= sql.size() || '(' != sql[open]) { return false; }
+  size_t close = 0;
+  if (!fs_find_matching(sql, open, close)) { return false; }
+  call.begin = name_pos;
+  call.end = close + 1;
+  call.name = fs_lower(sql.substr(name_pos, p - name_pos));
+  std::vector<std::string> args;
+  fs_split_args(sql.substr(open + 1, close - open - 1), args);
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string &a = args[i];
+    size_t eq = std::string::npos;
+    bool in_q = false;
+    int depth = 0;
+    for (size_t k = 0; k < a.size(); ++k) {
+      const char c = a[k];
+      if (in_q) {
+        if ('\'' == c) { in_q = false; }
+      } else if ('\'' == c) {
+        in_q = true;
+      } else if ('(' == c) {
+        ++depth;
+      } else if (')' == c) {
+        --depth;
+      } else if ('=' == c && 0 == depth) {
+        eq = k;
+        break;
+      }
+    }
+    if (std::string::npos != eq) {
+      call.named.push_back(std::make_pair(fs_lower(fs_trim(a.substr(0, eq))),
+                                          fs_trim(a.substr(eq + 1))));
+    } else {
+      call.pos.push_back(a);
+    }
+  }
+  return true;
+}
+
+bool fs_find_call(const std::string &sql, const size_t from, FsCall &call)
+{
+  static const char *names[] = {"read_csv", "read_json", "read_parquet", "glob"};
+  const std::string low = fs_lower(sql);
+  size_t best = std::string::npos;
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    size_t p = from;
+    while (std::string::npos != (p = low.find(names[i], p))) {
+      const bool left_ok = (0 == p) || !fs_ident(low[p - 1]);
+      if (left_ok) {
+        FsCall c;
+        if (fs_parse_call_at(sql, p, c)) {
+          if (c.begin < best) {
+            best = c.begin;
+            call = c;
+          }
+          break;
+        }
+      }
+      ++p;
+    }
+  }
+  return std::string::npos != best;
+}
+
+int fs_load_table(const FsCall &call, FsTable &t)
+{
+  int ret = 0;
+  if (call.pos.empty()) {
+    ret = -1;
+  } else {
+    const std::string path = fs_unquote(call.pos[0]);
+    if ("read_csv" == call.name) {
+      if (call.pos.size() >= 2) {
+        // format argument is not supported by the CSV reader
+        ret = OB_ERR_PARSE_SQL;
+      } else {
+        for (size_t i = 0; 0 == ret && i < call.named.size(); ++i) {
+          const std::string &k = call.named[i].first;
+          const std::string &v = fs_lower(fs_trim(call.named[i].second));
+          if ("sample_size" == k && "-1" != v) {
+            ret = OB_NOT_SUPPORTED;
+          } else if ("header" != k && "sample_size" != k) {
+            ret = OB_NOT_SUPPORTED;
+          }
+        }
+        std::string content;
+        if (0 == ret && 0 != fs_read_all(path, content)) {
+          ret = OB_NOT_SUPPORTED;
+        }
+        if (0 == ret) { fs_parse_csv(content, t); }
+      }
+    } else if ("read_json" == call.name) {
+      for (size_t i = 0; i < call.named.size(); ++i) {
+        const std::string &k = call.named[i].first;
+        const std::string v = fs_lower(fs_unquote(call.named[i].second));
+        if ("format" != k || "newline_delimited" != v) { ret = OB_NOT_SUPPORTED; }
+      }
+      std::string content;
+      if (0 == ret && 0 != fs_read_all(path, content)) { ret = OB_NOT_SUPPORTED; }
+      if (0 == ret) { fs_parse_jsonl(content, t); }
+    } else if ("glob" == call.name) {
+      if (0 != fs_glob(path, t)) { ret = OB_NOT_SUPPORTED; }
+    } else if ("read_parquet" == call.name) {
+      if (0 != fs_read_parquet(path, t)) { ret = OB_NOT_SUPPORTED; }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+    }
+  }
+  return ret;
+}
+
+int fs_replace_calls(const std::string &sql, std::string &out)
+{
+  int ret = 0;
+  const std::string low = fs_lower(sql);
+  out.clear();
+  size_t pos = 0;
+  while (0 == ret) {
+    FsCall call;
+    if (!fs_find_call(sql, pos, call)) { break; }
+    FsTable t;
+    if (0 != (ret = fs_load_table(call, t))) { break; }
+    out.append(sql, pos, call.begin - pos);
+    out += fs_table_sql(t);
+    pos = call.end;
+  }
+  if (0 == ret) { out.append(sql, pos, std::string::npos); }
+  return ret;
+}
+
+int fs_split_top(const std::string &s, const char *kw, size_t &at)
+{
+  const std::string low = fs_lower(s);
+  bool in_q = false;
+  int depth = 0;
+  const size_t klen = strlen(kw);
+  for (size_t i = 0; i + klen <= s.size(); ++i) {
+    const char c = s[i];
+    if (in_q) {
+      if ('\'' == c) { in_q = false; }
+      continue;
+    }
+    if ('\'' == c) { in_q = true; continue; }
+    if ('(' == c) { ++depth; continue; }
+    if (')' == c) { --depth; continue; }
+    if (0 == depth && 0 == low.compare(i, klen, kw)) {
+      // match the keyword as a whole word only: boundary chars must not be
+      // identifier characters, so any whitespace (space/newline/tab) works
+      // and words like "note"/"into"/"to_char" never match.
+      const char prev = (i > 0) ? s[i - 1] : ' ';
+      const char next = (i + klen < s.size()) ? s[i + klen] : ' ';
+      const bool prev_bad = (('a' <= prev && 'z' >= prev) || ('A' <= prev && 'Z' >= prev) ||
+                             ('0' <= prev && '9' >= prev) || ('_' == prev));
+      const bool next_bad = (('a' <= next && 'z' >= next) || ('A' <= next && 'Z' >= next) ||
+                             ('0' <= next && '9' >= next) || ('_' == next));
+      if (!prev_bad && !next_bad) {
+        at = i;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+int fs_handle_copy(const std::string &sql, std::string &out)
+{
+  int ret = 0;
+  size_t p = 0;
+  while (p < sql.size() && fs_space(sql[p])) { ++p; }
+  p += 4;  // copy
+  while (p < sql.size() && fs_space(sql[p])) { ++p; }
+  if (p >= sql.size() || '(' != sql[p]) { return -1; }
+  size_t close = 0;
+  if (!fs_find_matching(sql, p, close)) { return -1; }
+  const std::string inner = sql.substr(p + 1, close - p - 1);
+  p = close + 1;
+  while (p < sql.size() && fs_space(sql[p])) { ++p; }
+  if (p + 2 > sql.size() || 0 != fs_lower(sql.substr(p, 2)).compare("to")) { return -1; }
+  p += 2;
+  while (p < sql.size() && fs_space(sql[p])) { ++p; }
+  std::string path;
+  if (p < sql.size() && ('\'' == sql[p] || '"' == sql[p])) {
+    const char q = sql[p];
+    ++p;
+    while (p < sql.size() && sql[p] != q) { path.push_back(sql[p]); ++p; }
+    if (p < sql.size()) { ++p; }
+  } else {
+    return -1;
+  }
+  bool with_header = false;
+  std::string nullstr;
+  while (p < sql.size() && fs_space(sql[p])) { ++p; }
+  if (p < sql.size() && '(' == sql[p]) {
+    size_t oclose = 0;
+    if (!fs_find_matching(sql, p, oclose)) { return -1; }
+    std::vector<std::string> opts;
+    fs_split_args(sql.substr(p + 1, oclose - p - 1), opts);
+    for (size_t i = 0; i < opts.size(); ++i) {
+      const std::string o = fs_lower(fs_trim(opts[i]));
+      if (fs_starts_ci(o, "header")) {
+        with_header = true;
+      } else if (fs_starts_ci(o, "nullstr")) {
+        const size_t sp = opts[i].find_first_of('\'');
+        if (std::string::npos != sp) { nullstr = fs_unquote(opts[i].substr(sp)); }
+      }
+    }
+    p = oclose + 1;
+  }
+  size_t from_at = 0;
+  if (!fs_split_top(inner, "from", from_at)) { return -1; }
+  const std::string sel = fs_trim(inner.substr(0, from_at));
+  const std::string rest = inner.substr(from_at);
+  std::string sel_list = sel;
+  if (fs_starts_ci(sel_list, "select")) { sel_list = fs_trim(sel_list.substr(6)); }
+  const std::string low_rest = fs_lower(rest);
+  FsCall call;
+  if (!fs_find_call(rest, 0, call)) { return -1; }
+  FsTable t;
+  if (0 != (ret = fs_load_table(call, t))) { return ret; }
+  std::vector<size_t> proj;
+  std::vector<std::string> names;
+  std::vector<std::string> items;
+  fs_split_args(sel_list, items);
+  for (size_t i = 0; i < items.size(); ++i) {
+    std::string it = fs_trim(items[i]);
+    if ("*" == it) {
+      for (size_t c = 0; c < t.cols.size(); ++c) {
+        proj.push_back(c);
+        names.push_back(t.cols[c].name);
+      }
+    } else {
+      size_t alias = std::string::npos;
+      if (std::string::npos != (alias = fs_lower(it).find(" as "))) { it = fs_trim(it.substr(0, alias)); }
+      bool found = false;
+      for (size_t c = 0; c < t.cols.size(); ++c) {
+        if (fs_lower(fs_trim(it)) == fs_lower(t.cols[c].name)) {
+          proj.push_back(c);
+          names.push_back(t.cols[c].name);
+          found = true;
+          break;
+        }
+      }
+      if (!found) { return -1; }
+    }
+  }
+  int order_col = -1;
+  size_t ob_at = 0;
+  if (fs_split_top(rest, "order by", ob_at)) {
+    std::string ocol = fs_trim(rest.substr(ob_at + strlen("order by")));
+    // keep identifier characters only (drop a trailing ')' or tokens after it)
+    size_t cut = 0;
+    while (cut < ocol.size() && (('a' <= ocol[cut] && 'z' >= ocol[cut]) || ('A' <= ocol[cut] && 'Z' >= ocol[cut]) ||
+           ('0' <= ocol[cut] && '9' >= ocol[cut]) || ('_' == ocol[cut]))) { ++cut; }
+    ocol = ocol.substr(0, cut);
+    for (size_t c = 0; c < t.cols.size(); ++c) {
+      if (fs_lower(ocol) == fs_lower(t.cols[c].name)) { order_col = static_cast<int>(c); break; }
+    }
+  }
+  std::vector<size_t> order;
+  for (size_t r = 0; r < t.rows.size(); ++r) { order.push_back(r); }
+  if (order_col >= 0) {
+    const FsType ot = t.cols[order_col].type;
+    for (size_t i = 0; i + 1 < order.size(); ++i) {
+      for (size_t j = 0; j + 1 < order.size() - i; ++j) {
+        const std::string &a = t.rows[order[j]][order_col];
+        const std::string &b = t.rows[order[j + 1]][order_col];
+        bool swap = false;
+        if (FS_T_BIGINT == ot || FS_T_DOUBLE == ot) {
+          const double da = atof(a.c_str());
+          const double db = atof(b.c_str());
+          swap = da > db;
+        } else {
+          swap = a > b;
+        }
+        if (swap) { std::swap(order[j], order[j + 1]); }
+      }
+    }
+  }
+  std::string body;
+  if (with_header) {
+    for (size_t i = 0; i < names.size(); ++i) {
+      if (i > 0) { body.push_back(','); }
+      body += names[i];
+    }
+    body.push_back('\n');
+  }
+  for (size_t i = 0; i < order.size(); ++i) {
+    const FsRow &row = t.rows[order[i]];
+    for (size_t k = 0; k < proj.size(); ++k) {
+      if (k > 0) { body.push_back(','); }
+      const std::string &v = row[proj[k]];
+      if (v.empty()) {
+        body += nullstr;
+      } else if (std::string::npos != v.find(',') || std::string::npos != v.find('"') ||
+                 std::string::npos != v.find('\n')) {
+        body.push_back('"');
+        for (size_t x = 0; x < v.size(); ++x) {
+          if ('"' == v[x]) { body += "\"\""; } else { body.push_back(v[x]); }
+        }
+        body.push_back('"');
+      } else {
+        body += v;
+      }
+    }
+    body.push_back('\n');
+  }
+  FILE *fp = fopen(path.c_str(), "wb");
+  if (NULL == fp) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    if (!body.empty()) { fwrite(body.data(), 1, body.size(), fp); }
+    fclose(fp);
+    out = "set @__fs_copy = 1";  // OK packet without any result set/header
+  }
+  return ret;
+}
+
+int fs_handle_describe(const std::string &sql, std::string &out)
+{
+  int ret = 0;
+  const std::string low = fs_lower(sql);
+  FsCall call;
+  if (!fs_find_call(sql, 0, call)) { return -1; }
+  FsTable t;
+  if (0 != (ret = fs_load_table(call, t))) { return ret; }
+  out = fs_desc_sql(t);
+  return ret;
+}
+
+int fs_rewrite(common::ObIAllocator &alloc,
+               ObSQLSessionInfo &session,
+               const common::ObString &sql_in,
+               common::ObString &sql_out)
+{
+  int ret = OB_SUCCESS;
+  sql_out.reset();
+  if (sql_in.empty()) { return ret; }
+  const std::string sql(sql_in.ptr(), static_cast<size_t>(sql_in.length()));
+  const std::string low = fs_lower(sql);
+  const std::string head = fs_lower(fs_trim(sql));
+  const bool has_func = (std::string::npos != low.find("read_csv")) ||
+                        (std::string::npos != low.find("read_json")) ||
+                        (std::string::npos != low.find("read_parquet")) ||
+                        (std::string::npos != low.find("glob("));
+  size_t copy_to_at = 0;
+  const bool is_copy = fs_starts_ci(head, "copy") && 0 != fs_split_top(sql, "to", copy_to_at);
+  const bool is_desc = fs_starts_ci(head, "describe") || fs_starts_ci(head, "desc ");
+  if (!has_func && !(is_copy && std::string::npos != low.find("read_csv"))) {
+    return ret;
+  }
+  bool enabled = false;
+  if (OB_SUCCESS != session.get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled)) {
+    enabled = false;
+  }
+  if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+  }
+  std::string out;
+  if (OB_SUCC(ret)) {
+    if (is_desc && has_func) {
+      ret = fs_handle_describe(sql, out);
+    } else if (is_copy) {
+      ret = fs_handle_copy(sql, out);
+    } else {
+      ret = fs_replace_calls(sql, out);
+    }
+  }
+  if (OB_SUCC(ret) && !out.empty() && out != sql) {
+    char *buf = static_cast<char *>(alloc.alloc(out.size()));
+    if (NULL == buf) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(buf, out.data(), out.size());
+      sql_out.assign_ptr(buf, static_cast<int32_t>(out.size()));
+    }
+  }
+  if (OB_SUCCESS != ret) {
+    LOG_WARN("file sql rewrite failed", K(ret), K(sql_in));
+  }
+  return ret;
+}
+
+}  // namespace file_sql
 
 }//end of namespace sql
 }//end of namespace oceanbase

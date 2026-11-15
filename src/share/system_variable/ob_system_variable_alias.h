@@ -32,6 +32,7 @@ namespace share
   static const char* const OB_SV_COLLATION_CONNECTION = "collation_connection";
   static const char* const OB_SV_COLLATION_DATABASE = "collation_database";
   static const char* const OB_SV_COLLATION_SERVER = "collation_server";
+  static const char* const OB_SV_ENABLE_FILE_SQL = "enable_file_sql";
   static const char* const OB_SV_INTERACTIVE_TIMEOUT = "interactive_timeout";
   static const char* const OB_SV_LAST_INSERT_ID = "last_insert_id";
   static const char* const OB_SV_MAX_ALLOWED_PACKET = "max_allowed_packet";

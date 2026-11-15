@@ -203,6 +203,19 @@
     "background_cn": "",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "allow querying local CSV/JSON/Parquet files as tables",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "publish_version": "",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "interactive_timeout": {
     "id": 12,
     "name": "interactive_timeout",
